@@ -108,6 +108,22 @@ var (
 		func() float64 { return float64(goebpfmetrics.ProgLoadEAGAINExhausted()) },
 	)
 
+	sdkMapMutateENOMEMRetries = prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "awsnodeagent_aws_ebpfsdk_map_mutate_enomem_retries_total",
+			Help: "Cumulative BPF map mutation attempts retried by the SDK after the kernel returned ENOMEM",
+		},
+		func() float64 { return float64(goebpfmetrics.MapMutateENOMEMRetries()) },
+	)
+
+	sdkMapMutateENOMEMExhausted = prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "awsnodeagent_aws_ebpfsdk_map_mutate_enomem_exhausted_total",
+			Help: "Cumulative BPF map mutations that exhausted all SDK retries on ENOMEM and were left unprogrammed (enforcement gaps)",
+		},
+		func() float64 { return float64(goebpfmetrics.MapMutateENOMEMExhausted()) },
+	)
+
 	prometheusRegistered = false
 )
 
@@ -125,6 +141,8 @@ func prometheusRegister() {
 		metrics.Registry.MustRegister(sdkAPIErr)
 		metrics.Registry.MustRegister(sdkProgLoadEAGAINRetries)
 		metrics.Registry.MustRegister(sdkProgLoadEAGAINExhausted)
+		metrics.Registry.MustRegister(sdkMapMutateENOMEMRetries)
+		metrics.Registry.MustRegister(sdkMapMutateENOMEMExhausted)
 		prometheusRegistered = true
 	}
 }
