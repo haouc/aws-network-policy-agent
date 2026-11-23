@@ -33,6 +33,11 @@ type InMemoryBpfMap struct {
 // tests can build shadow maps without a kernel.
 var newInMemoryBpfMap = NewInMemoryBpfMap
 
+// bulkRefreshAddRetries is how many extra passes BulkRefresh makes over the adds the
+// kernel rejected, before it gives up and sweeps. Small on purpose: the map lock is
+// held across the retries and this runs on the pod add path.
+const bulkRefreshAddRetries = 2
+
 // updateEntryOrSDK and deleteEntryOrSDK write to the kernel, honouring a test
 // hook when one is installed. The backing slice is kept alive across the call,
 // since a uintptr is not a reference as far as the collector is concerned.
@@ -149,23 +154,45 @@ func (m *InMemoryBpfMap) BulkRefresh(newMapContents map[string][]byte) error {
 	var failedKeys []string
 	var firstErr error
 
-	// Apply updates to kernel
+	// Apply updates to kernel. A key that fails is retried before the sweep below,
+	// because the sweep deletes the entry this add was replacing: an except CIDR is
+	// stored as its own deny, so losing the old deny without landing the new one
+	// leaves the traffic falling through to the enclosing allow, which is more
+	// permissive than either the old or the new policy. The failure this guards is
+	// a transient per-CPU allocator refill, so a bounded immediate retry clears it
+	// without holding the map lock for long.
+	pending := make(map[string][]byte, len(toAdd))
 	for k, v := range toAdd {
-		keyByte := []byte(k)
+		pending[k] = v
+	}
 
-		if err := m.updateEntryOrSDK(keyByte, v); err != nil {
-			// Carry on rather than return. Aborting here would leave the kernel
-			// holding a random subset of the new entries and skip the stale-entry
-			// sweep below, so a policy the user revoked would stay in force.
-			failedKeys = append(failedKeys, fmt.Sprintf("%x", keyByte))
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
+	for attempt := 0; attempt <= bulkRefreshAddRetries; attempt++ {
+		if attempt > 0 {
+			// Yield rather than sleep. The lock is held and this is on the pod add
+			// path, and the refill this waits on happens on another CPU.
+			runtime.Gosched()
 		}
+		for k, v := range pending {
+			keyByte := []byte(k)
+			if err := m.updateEntryOrSDK(keyByte, v); err != nil {
+				// Carry on rather than return, so one bad key cannot abandon the
+				// remaining adds.
+				if attempt == bulkRefreshAddRetries {
+					failedKeys = append(failedKeys, fmt.Sprintf("%x", keyByte))
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+				continue
+			}
 
-		// Update in-memory after successful kernel update
-		m.contents[k] = v
+			// Update in-memory after successful kernel update
+			m.contents[k] = v
+			delete(pending, k)
+		}
+		if len(pending) == 0 {
+			break
+		}
 	}
 
 	// Apply deletes to kernel

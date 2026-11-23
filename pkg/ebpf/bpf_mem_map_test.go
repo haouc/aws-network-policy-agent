@@ -127,3 +127,47 @@ func TestSummarizeKeys(t *testing.T) {
 	assert.Equal(t, "a, b, c", summarizeKeys([]string{"a", "b", "c"}))
 	assert.Equal(t, "a, b, c and 2 more", summarizeKeys([]string{"a", "b", "c", "d", "e"}))
 }
+
+// An except CIDR is stored as its own deny entry, so widening the except adds a
+// shorter deny and deletes the longer one. If the add fails and the sweep runs
+// anyway, the traffic falls through to the enclosing allow, which neither the old
+// nor the new policy permits. A transient rejection must not open that gap.
+func TestBulkRefresh_TransientAddFailureDoesNotDropTheDenyItReplaces(t *testing.T) {
+	allow16, deny24, deny23 := key(16), key(24), key(23)
+	m, f := newTestMap(map[string][]byte{allow16: val(1), deny24: val(9)})
+
+	// Reject the new deny once, as a per-CPU allocator refill does.
+	failures := 1
+	inner := m.updateEntry
+	m.updateEntry = func(k, v []byte) error {
+		if string(k) == deny23 && failures > 0 {
+			failures--
+			return fmt.Errorf("unable to update map: %w", unix.ENOMEM)
+		}
+		return inner(k, v)
+	}
+
+	err := m.BulkRefresh(map[string][]byte{allow16: val(1), deny23: val(9)})
+
+	assert.NoError(t, err, "a transient rejection must be retried, not reported")
+	assert.Equal(t, val(9), f.entries[deny23], "the replacement deny must land")
+	assert.NotContains(t, f.entries, deny24, "the superseded deny is swept once its replacement is in")
+	assert.Equal(t, val(1), f.entries[allow16])
+}
+
+// With the retries exhausted the add is reported, and the sweep still runs so a
+// revoked allow cannot survive. The stale deny going with it is the residual case
+// a persistent rejection leaves open.
+func TestBulkRefresh_PersistentAddFailureStillSweeps(t *testing.T) {
+	allow16, deny24, deny23 := key(16), key(24), key(23)
+	m, f := newTestMap(map[string][]byte{allow16: val(1), deny24: val(9)})
+	f.updateErrs[deny23] = fmt.Errorf("unable to update map: %w", unix.ENOSPC)
+
+	err := m.BulkRefresh(map[string][]byte{allow16: val(1), deny23: val(9)})
+
+	assert.Error(t, err, "an add the kernel keeps rejecting must be reported for requeue")
+	assert.Contains(t, err.Error(), "1 of 1 map updates failed")
+	assert.NotContains(t, f.entries, deny23)
+	assert.NotContains(t, m.contents, deny23)
+	assert.NotContains(t, f.entries, deny24)
+}
